@@ -33,6 +33,13 @@ const char SENSORS_BMP180[] PROGMEM = "BMP180";
 const char SENSORS_BMP280[] PROGMEM = "BMP280";
 const char SENSORS_BME280[] PROGMEM = "BME280";
 
+const char SENSORS_ADS_WS1_WS[] PROGMEM = "ADS-WS1-WS";
+const char SENSORS_ADS_WS1_WD[] PROGMEM = "ADS-WS1-WD";
+const char SENSORS_ADS_WS1_RG[] PROGMEM = "ADS-WS1-RG";
+const char SENSORS_DAVIS_WS[] PROGMEM = "DAVIS-WS";
+const char SENSORS_DAVIS_WD[] PROGMEM = "DAVIS-WD";
+const char SENSORS_RG_11[] PROGMEM = "RG-11";
+
 const char WEB_PAGE_HEADER[] PROGMEM = "<!DOCTYPE html><html>\
 <head>\
 <title>{t}</title>\

@@ -128,6 +128,34 @@
 #define GPS_READ 0
 #define GPS_API_PIN 9
 
+// Weather station (Wind speed and direction, rain meter) connected?
+#define WS_READ 1
+#define ADS_WS1_WS_READ 0
+#define ADS_WS1_WD_READ 0
+#define ADS_WS1_RG_READ 0
+#define DAVIS_WS_READ 0
+#define DAVIS_WD_READ 0
+#define RG_11_READ 0
+
+#define ADS_WS1_Wspeed 0
+#define ADS_WS1_Wdir 0
+#define ADS_WS1_RainGauge 0
+#define DAVIS_Wspeed 0
+#define DAVIS_Wdir 0
+#define RG_11_RainGauge 0
+
+#define WINDSPEED_PIN D5
+#define WINDDIR_PIN A0
+#define RAINGAUGE_PIN D6 // FIXME ADD API_PIN for Weather station sensors
+
+// ADS1115 I2C ADDR
+#define ADS1115 1
+#define ADS1115_I2C_ADDR 0x48
+
+// ADC OFFSET AND GAIN
+#define ADC_OFFSET 0.0
+#define ADC_GAIN 1.0
+
 // automatic firmware updates
 #define AUTO_UPDATE 1
 

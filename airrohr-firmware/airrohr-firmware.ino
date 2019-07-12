@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#define INTL_DE
+#define INTL_EN
 
 /************************************************************************
  *                                                                      *
@@ -127,6 +127,7 @@
 #include <Adafruit_BME280.h>
 #include <DallasTemperature.h>
 #include <TinyGPS++.h>
+#include <Adafruit_ADS1015.h>
 #include <time.h>
 #include <coredecls.h>
 #include <assert.h>
@@ -207,6 +208,12 @@ namespace cfg {
 	bool bmp280_read = BMP280_READ;
 	bool bme280_read = BME280_READ;
 	bool ds18b20_read = DS18B20_READ;
+  bool ads_ws1_wspeed_read = ADS_WS1_WS_READ;
+  bool ads_ws1_wdir_read = ADS_WS1_WD_READ;
+  bool ads_ws1_raingauge_read = ADS_WS1_RG_READ;
+  bool davis_wspeed_read = DAVIS_WS_READ;
+  bool davis_wdir_read = DAVIS_WD_READ;
+  bool rg_11_raingauge_read = RG_11_READ;
 	bool gps_read = GPS_READ;
 	bool send2dusti = SEND2DUSTI;
 	bool send2madavi = SEND2MADAVI;
@@ -408,6 +415,58 @@ int hpm_pm10_min = 20000;
 int hpm_pm25_max = 0;
 int hpm_pm25_min = 20000;
 
+/*****************************************************************
+/* Wind speed and direction and rain sensors ADS-WS1 p/n 80422   *
+/*****************************************************************/
+const int DIR_N_VAL = 16;
+int debounce_time = 10000; //us 
+
+// Interrupt managed variables 
+const long windspeed_max_period = 10000000; // max period between two wind ticks is 10000000 us. Larger periods are considered as no wind (Wind less than 1km/h)
+volatile long windspeed_period;             // Used to store the last wind sensor tick period
+volatile long windspeed_min_period;         // Used to store the gust
+volatile long windspeed_avg_period;         // Used to store the average wind speed between two sensor read
+volatile long windspeed_start;              // Used to store the starting time for computing the period between two consecutive ticks
+volatile int windspeed_first_flag;          // Not sure if it is going to be used 
+volatile long windspeed_count;              // Used to store the number of measured periods
+
+volatile long rain_period;
+volatile long rain_start;
+volatile int rain_first_flag;
+volatile long rain_count; 
+
+long windspeed_prev_count;
+long rain_prev_count;
+
+float windspeed_per_tick;
+float wind_direction;
+float rain_sensivity; 
+
+int windspeed_pin = WINDSPEED_PIN;
+int rain_pin = RAINGAUGE_PIN;
+int wind_direction_pin = WINDDIR_PIN;
+
+// ADC reference data
+float v_ref = 3.3; // Volt
+float v_out[DIR_N_VAL+2]; // This is the vector with the voltages related to wind direction. It is initialized in the sensor init function 
+float adc_offset = 0.0;
+float adc_gain = 1.0;
+
+// Node MCU ADC data
+// voltage divider factor of Nodemcu before the ADC input  
+float voltage_divider_factor = 0.3125; // nodemcu use a voltage divider (100K/(100K+220)) at the adc input
+float v_LSB = 1.0 / 1023; // V. v_LSB is about 1V/1023
+
+// Voltage divider data of AWS wind direction sensor
+float r_part_aws = 10000; // Ohm
+float dir_val[DIR_N_VAL+2] = {-1.0, 112.5, 67.5, 90, 157.5, 135, 202.5, 180, 22.5, 45 , 247.5, 225, 337.5, 0, 292.5, 315, 270, -1.0}; // -1.0 is used for voltage measure both to low or to high
+float resistances_aws[DIR_N_VAL] = {688, 891, 1000, 1410, 2200, 3140, 3900, 6570, 8200, 14120, 16000, 21880, 33000, 42120, 64900, 120000};
+
+// External ADS1115 ADC data
+Adafruit_ADS1115 ads1115(ADS1115_I2C_ADDR); // ADS1115 ADC instance.
+float ads1115_LSB = 0.125; // mV
+//float ads1115_LSB = 0.1875; // mV
+
 double last_value_PPD_P1 = -1.0;
 double last_value_PPD_P2 = -1.0;
 double last_value_SDS_P1 = -1.0;
@@ -429,6 +488,12 @@ double last_value_BME280_T = -128.0;
 double last_value_BME280_H = -1.0;
 double last_value_BME280_P = -1.0;
 double last_value_DS18B20_T = -1.0;
+double last_value_ADS_WS1_windSpeed = 0.0;
+double last_value_ADS_WS1_windDir = 0.0;
+double last_value_ADS_WS1_rain = 0.0;
+double last_value_Davis_windSpeed = 0.0;
+double last_value_Davis_windDir = 0.0;
+double last_value_RG_11_rain = 0.0;
 double last_value_GPS_lat = -200.0;
 double last_value_GPS_lon = -200.0;
 double last_value_GPS_alt = -1000.0;
@@ -886,6 +951,14 @@ void readConfig() {
 					setFromJSON(bme280_read);
 					setFromJSON(ds18b20_read);
 					setFromJSON(gps_read);
+          setFromJSON(ads_ws1_raingauge_read);
+          setFromJSON(ads_ws1_wspeed_read);
+          setFromJSON(ads_ws1_wdir_read);
+          setFromJSON(rg_11_raingauge_read);
+          setFromJSON(davis_wspeed_read);
+          setFromJSON(davis_wdir_read);
+          setFromJSON(adc_offset);
+          setFromJSON(adc_gain);
 					setFromJSON(send2dusti);
 					setFromJSON(ssl_dusti);
 					setFromJSON(send2madavi);
@@ -954,6 +1027,7 @@ void writeConfig() {
 
 #define copyToJSON_Bool(varname) json_string += Var2Json(#varname,varname);
 #define copyToJSON_Int(varname) json_string += Var2Json(#varname,varname);
+#define copyToJSON_Float(varname) json_string +="\""+String(#varname)+"\":"+Float2String(varname)+",";
 #define copyToJSON_String(varname) json_string += Var2Json(#varname,String(varname));
 	copyToJSON_String(current_lang);
 	copyToJSON_String(SOFTWARE_VERSION);
@@ -975,6 +1049,14 @@ void writeConfig() {
 	copyToJSON_Bool(bme280_read);
 	copyToJSON_Bool(ds18b20_read);
 	copyToJSON_Bool(gps_read);
+  copyToJSON_Bool(ads_ws1_raingauge_read);
+  copyToJSON_Bool(ads_ws1_wspeed_read);
+  copyToJSON_Bool(ads_ws1_wdir_read);
+  copyToJSON_Bool(rg_11_raingauge_read);
+  copyToJSON_Bool(davis_wspeed_read);
+  copyToJSON_Bool(davis_wdir_read);
+  copyToJSON_Float(adc_offset);
+  copyToJSON_Float(adc_gain);
 	copyToJSON_Bool(send2dusti);
 	copyToJSON_Bool(ssl_dusti);
 	copyToJSON_Bool(send2madavi);
@@ -1118,6 +1200,22 @@ String form_checkbox(const String& name, const String& info, const bool checked,
 
 String form_checkbox_sensor(const String& name, const String& info, const bool checked) {
 	return form_checkbox(name, add_sensor_type(info), checked);
+}
+
+String form_checkbox_button(const String& name, const String& info, const bool checked, const String& value, const String& href) {
+  String s;
+  if (checked) {
+    s = F("<label for='{n}'><input type='checkbox' name='{n}' value='1' id='{n}' {c}/><input type='hidden' name='{n}' value='0' /> {i}</label> <a href='/{link}' style='display:inline;'>{v}</a><br/>");
+    s.replace("{c}", F(" checked='checked'"));
+    s.replace("{link}", href);
+    s.replace("{v}", value);
+  }
+  else{
+    s = F("<label for='{n}'><input type='checkbox' name='{n}' value='1' id='{n}' {c}/><input type='hidden' name='{n}' value='0' /> {i}</label><br/>");
+    s.replace("{c}", "");
+  }
+  s.replace("{i}", info); s.replace("{n}", name);
+  return s;
 }
 
 String form_submit(const String& value) {
@@ -1387,6 +1485,13 @@ void webserver_config() {
 			page_content += form_checkbox_sensor("bme280_read", FPSTR(INTL_BME280), bme280_read);
 			page_content += form_checkbox_sensor("ds18b20_read", FPSTR(INTL_DS18B20), ds18b20_read);
 			page_content += form_checkbox("gps_read", FPSTR(INTL_NEO6M), gps_read);
+      page_content += form_checkbox("ads_ws1_raingauge_read", FPSTR(INTL_ADS_WS1_RainGauge), ads_ws1_raingauge_read);
+      page_content += form_checkbox("ads_ws1_wspeed_read", FPSTR(INTL_ADS_WS1_Wspeed), ads_ws1_wspeed_read);
+      page_content += form_checkbox_button("ads_ws1_wdir_read", FPSTR(INTL_ADS_WS1_Wdir), ads_ws1_wdir_read, "Calibration", "calibration");
+      page_content += form_checkbox("rg_11_raingauge_read", FPSTR(INTL_RG_11_RainGauge), rg_11_raingauge_read);
+      page_content += form_checkbox("davis_wspeed_read", FPSTR(INTL_DAVIS_Wspeed), davis_wspeed_read);
+      page_content += form_checkbox_button("davis_wdir_read", FPSTR(INTL_DAVIS_Wdir), davis_wdir_read, "Calibration", "calibration");
+     
 			page_content += F("<br/><br/>\n<b>");
 		}
 
@@ -1467,6 +1572,14 @@ void webserver_config() {
 			} \
 		}
 
+#define readFloatParam(param) \
+    if (server.hasArg(#param)){ \
+      int val = server.arg(#param).toFloat(); \
+      if (val != 0){ \
+        param = val; \
+      } \
+    }
+
 #define readTimeParam(param) \
 		if (server.hasArg(#param)){ \
 			int val = server.arg(#param).toInt(); \
@@ -1511,6 +1624,14 @@ void webserver_config() {
 			readBoolParam(bme280_read);
 			readBoolParam(ds18b20_read);
 			readBoolParam(gps_read);
+      readBoolParam(ads_ws1_raingauge_read);
+      readBoolParam(ads_ws1_wspeed_read);
+      readBoolParam(ads_ws1_wdir_read);
+      readBoolParam(rg_11_raingauge_read);
+      readBoolParam(davis_wspeed_read);
+      readBoolParam(davis_wdir_read);
+      readFloatParam(adc_offset);
+      readFloatParam(adc_gain);      
 
 			readIntParam(debug);
 			readTimeParam(sending_intervall_ms);
@@ -1566,6 +1687,14 @@ void webserver_config() {
 		page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "BME280"), String(bme280_read));
 		page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "DS18B20"), String(ds18b20_read));
 		page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "GPS"), String(gps_read));
+    page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "ADS-WS1 Rain gauge"), String(ads_ws1_raingauge_read));   
+    page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "ADS-WS1 Wind speed"), String(ads_ws1_wspeed_read));
+    page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "ADS-WS1 Wind dir"), String(ads_ws1_wdir_read));
+    page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "RG-11 Rain gauge"), String(rg_11_raingauge_read));   
+    page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "Davis Wind speed"), String(davis_wspeed_read));
+    page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "Davis Wind dir"), String(davis_wdir_read));
+    page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "ADC offset"), String(adc_offset));
+    page_content += line_from_value(tmpl(FPSTR(INTL_READ_FROM), "ADC gain"), String(adc_gain));
 		page_content += line_from_value(FPSTR(INTL_AUTO_UPDATE), String(auto_update));
 		page_content += line_from_value(FPSTR(INTL_USE_BETA), String(use_beta));
 		page_content += line_from_value(FPSTR(INTL_DISPLAY), String(has_display));
@@ -1681,6 +1810,10 @@ void webserver_values() {
 		const String unit_T = "°C";
 		const String unit_H = "%";
 		const String unit_P = "hPa";
+    const String unit_ws = "m/s";
+    const String unit_wd = "°";
+    const String unit_rg = "mm";
+    
 		last_page_load = millis();
 
 		const int signal_quality = calcWiFiSignalQuality(WiFi.RSSI());
@@ -1753,6 +1886,24 @@ void webserver_values() {
 			page_content += table_row_from_value("GPS", FPSTR(INTL_DATE), last_value_GPS_date, "");
 			page_content += table_row_from_value("GPS", FPSTR(INTL_TIME), last_value_GPS_time, "");
 		}
+    if (cfg::ads_ws1_wspeed_read) {
+      page_content += table_row_from_value(FPSTR(SENSORS_ADS_WS1_WS), FPSTR(INTL_WINDSPEED), check_display_value(last_value_ADS_WS1_windSpeed, -1, 1, 0), unit_ws);
+    }
+    if (cfg::ads_ws1_wdir_read) {
+      page_content += table_row_from_value(FPSTR(SENSORS_ADS_WS1_WD), FPSTR(INTL_WINDDIR), check_display_value(last_value_ADS_WS1_windDir, -1, 1, 0), unit_wd);
+    }
+    if (cfg::ads_ws1_raingauge_read) {
+      page_content += table_row_from_value(FPSTR(SENSORS_ADS_WS1_RG), FPSTR(INTL_RAIN), check_display_value(last_value_ADS_WS1_rain, -1, 1, 0), unit_rg);
+    }
+    if (cfg::davis_wspeed_read) {
+      page_content += table_row_from_value(FPSTR(SENSORS_DAVIS_WS), FPSTR(INTL_WINDSPEED), check_display_value(last_value_Davis_windSpeed, -1, 1, 0), unit_ws);
+    }
+    if (cfg::davis_wdir_read) {
+      page_content += table_row_from_value(FPSTR(SENSORS_DAVIS_WD), FPSTR(INTL_WINDDIR), check_display_value(last_value_Davis_windDir, -1, 1, 0), unit_wd);
+    }
+    if (cfg::rg_11_raingauge_read) {
+      page_content += table_row_from_value(FPSTR(SENSORS_RG_11), FPSTR(INTL_RAIN), check_display_value(last_value_RG_11_rain, -1, 1, 0), unit_rg);
+    }
 
 		page_content += FPSTR(EMPTY_ROW);
 		page_content += table_row_from_value("WiFi", FPSTR(INTL_SIGNAL_STRENGTH),  String(WiFi.RSSI()), "dBm");
@@ -2085,6 +2236,18 @@ void wifiConfig() {
 	debug_out(F("BMP: "), DEBUG_MIN_INFO, 0);
 	debug_out(String(cfg::bmp_read), DEBUG_MIN_INFO, 1);
 	debug_out(F("----\nSend to ..."), DEBUG_MIN_INFO, 1);
+  debug_out(F("ADS-WS1_windspeed_read: "), DEBUG_MIN_INFO, 0); 
+  debug_out(String(cfg::ads_ws1_wspeed_read), DEBUG_MIN_INFO, 1);
+  debug_out(F("ADS-WS1_winddir_read: "), DEBUG_MIN_INFO, 0); 
+  debug_out(String(cfg::ads_ws1_wdir_read), DEBUG_MIN_INFO, 1);
+  debug_out(F("ADS-WS1_raingauge_read: "), DEBUG_MIN_INFO, 0); 
+  debug_out(String(cfg::ads_ws1_raingauge_read), DEBUG_MIN_INFO, 1);
+  debug_out(F("Davis_windspeed_read: "), DEBUG_MIN_INFO, 0); 
+  debug_out(String(cfg::davis_wspeed_read), DEBUG_MIN_INFO, 1);
+  debug_out(F("Davis_winddir_read: "), DEBUG_MIN_INFO, 0); 
+  debug_out(String(cfg::davis_wdir_read), DEBUG_MIN_INFO, 1);
+  debug_out(F("RG_11_raingauge_read: "), DEBUG_MIN_INFO, 0); 
+  debug_out(String(cfg::rg_11_raingauge_read), DEBUG_MIN_INFO, 1);
 	debug_out(F("Dusti: "), DEBUG_MIN_INFO, 0);
 	debug_out(String(cfg::send2dusti), DEBUG_MIN_INFO, 1);
 	debug_out(F("Madavi: "), DEBUG_MIN_INFO, 0);
@@ -3198,6 +3361,174 @@ String sensorGPS() {
 	return s;
 }
 
+/**************************************************************
+/* read wind direction                                        *
+/**************************************************************/
+String sensorADS_WS1_WindDir(){
+  String s = "";
+  int adc0;
+  float voltage; 
+  
+  // ADS_WS1 is the default sensor
+    voltage = adc_voltage();
+    // Search for wind direction
+    float v_l = v_out[0];
+    
+    for (int i=1;  i<DIR_N_VAL+2; i++){
+      float v_r = v_out[i];
+      if (voltage < v_r) {
+        if ((v_r - voltage) < (voltage - v_l)){
+          wind_direction = dir_val[i];
+          break;
+        }
+        else{
+          wind_direction = dir_val[i-1];
+          break;
+        }
+      }
+      v_l = v_r;
+    }    
+    last_value_ADS_WS1_windDir = wind_direction;
+    s += Value2Json(F("ADS-WS1_windDir"),  Float2String(last_value_ADS_WS1_windDir));
+    
+    debug_out("ADS_WS1 WIND DIR ----------------------------------------" + Float2String(float(adc0)), DEBUG_MED_INFO, 1);
+    
+    return s;
+}
+
+String sensorDavis_WindDir(){
+  String s = "";
+  int adc0;
+  float voltage; 
+
+  // Perform 10 measures and take the mean value
+  const int n_measures = 10;
+  float angle_rad;
+  float sum_cos = 0.0;
+  float sum_sin = 0.0;
+      
+  for (int i=0; i<n_measures; i++){
+    voltage = adc_voltage();
+    //angle_rad = map(voltage, 0, v_ref, 0, 2*M_PI);
+    angle_rad = voltage * (2*M_PI) / v_ref;
+    sum_cos += cos(angle_rad);
+    sum_sin += sin(angle_rad);    
+    debug_out("Wind DIR, " + Float2String(adc0) + ' - ' + Float2String(voltage) + ' - ' + Float2String(angle_rad), DEBUG_MAX_INFO, 1);
+  }
+  
+  wind_direction = atan2(sum_sin, sum_cos); // in rad
+  if (wind_direction < 0.0) {
+    wind_direction = 2*M_PI + wind_direction;
+  }
+  wind_direction = wind_direction * 360 / (2*M_PI);
+  last_value_Davis_windDir = wind_direction;
+  s += Value2Json(F("Davis_windDir"), Float2String(last_value_Davis_windDir));   
+  
+  debug_out("DAVIS WIND DIR ----------------------------------------" + Float2String(wind_direction), DEBUG_MED_INFO, 1);  
+  debug_out("ADC GAIN = " + Float2String(float(adc_gain)) + ", ADC offset = " + Float2String(float(adc_offset)), DEBUG_MED_INFO, 1);
+ 
+  return s;
+}
+
+String sensorWindDir(){
+  // No generic function needed for wind direction  
+}
+
+/**************************************************************
+/* read wind speed                                            *
+/**************************************************************/
+
+String sensorADS_WS1_WindSpeed(){
+  String s = "";
+  float wind_speed;
+  const float windspeed_per_tick = 0.666667; // 2.4 Km/h for each tick --> 0.666667 m/s
+  
+  float wsp_s = sensorWindSpeed();
+
+  if (wsp_s == -1.0)
+    wind_speed = 0.0;
+  else
+    wind_speed = windspeed_per_tick / wsp_s;;
+
+  last_value_ADS_WS1_windSpeed = wind_speed;
+  s += Value2Json(F("ADS-WS1_windSpeed"), Float2String(last_value_ADS_WS1_windSpeed)); 
+
+  return s;
+}
+
+String sensorDavis_WindSpeed(){
+  String s = "";
+  float wind_speed;
+  const float windspeed_per_tick = 1.00584; // 3.621 Km/h for each tick --> 1.00584 m/s
+  
+  float wsp_s = sensorWindSpeed();
+
+  if (wsp_s == -1.0)
+    wind_speed = 0.0;
+  else
+    wind_speed = windspeed_per_tick / wsp_s;
+      
+  last_value_Davis_windSpeed = wind_speed;
+  s += Value2Json(F("Davis_windSpeed"), Float2String(last_value_Davis_windSpeed));   
+
+  return s;
+}
+
+float sensorWindSpeed(){
+  // Get wind speed measures and re-initialize variable for the next ones.
+  // Disable windspeed interrupts 
+  
+  float wsp_s = windspeed_period/1000000.; // windspeed_period in sec. 
+  
+  float current_wsp_ms = (micros() - windspeed_start) / 1000.; // current windspeed_period in millisec. 
+  
+  // timeout implementation to set the wind speed to 0 m/s if the period is larger than the sending time interval - eps
+  if (current_wsp_ms > (cfg::sending_intervall_ms - 100.)) {
+    // reset wind speed measurement
+    windspeed_first_flag = true;
+    windspeed_start = micros();
+    wsp_s = -1.0; // default value to set not wind   
+    debug_out("WIND SPEED -- RESET", DEBUG_MED_INFO, 1);
+  }
+
+  debug_out("WIND SPEED ----------------------------------------" + Float2String(float(windspeed_period)), DEBUG_MED_INFO, 1);
+
+  // Re-enable wind interrupts 
+  return wsp_s;
+}
+
+
+/**************************************************************
+/* read rain                                                  *
+/**************************************************************/
+String sensorADS_WS1_Rain(){
+  String s = "";
+  const float rain_sensitivity = 0.2794; // mm per tick
+
+  float rain_mm = rain_count * rain_sensitivity;
+  
+  last_value_ADS_WS1_rain = rain_mm;
+  s += Value2Json(F("ADS-WS1_rain"), Float2String(last_value_ADS_WS1_rain));
+
+  debug_out("ADS WS1 RAIN ----------------------------------------" + Float2String(float(rain_count)), DEBUG_MED_INFO, 1);
+
+  return s;
+}
+
+String sensorRG_11_Rain() {
+  String s = "";
+  const float rain_sensitivity = 0.2; // mm per tick
+
+  float rain_mm = rain_count * rain_sensitivity;
+  
+  last_value_RG_11_rain = rain_mm;
+  s += Value2Json(F("RG-11_rain"), Float2String(last_value_RG_11_rain));
+
+  debug_out("RG11 RAIN ----------------------------------------" + Float2String(float(rain_count)), DEBUG_MED_INFO, 1);
+
+  return s;
+}
+
 /*****************************************************************
  * AutoUpdate                                                    *
  *****************************************************************/
@@ -3264,6 +3595,19 @@ void display_values() {
 	int screen_count = 0;
 	int screens[5];
 	int line_count = 0;
+  String ads_ws1_wspeed_sensor = "";
+  String ads_ws1_wdir_sensor = "";
+  double ads_ws1_wspeed_value = 0.0;
+  double ads_ws1_wdir_value = 0.0;
+  String ads_ws1_raingauge_sensor = "";  
+  double ads_ws1_raingauge_value = 0.0;
+  String davis_wspeed_sensor = "";
+  String davis_wdir_sensor = "";
+  double davis_wspeed_value = 0.0;
+  double davis_wdir_value = 0.0;
+  String rg_11_raingauge_sensor = "";
+  double rg_11_raingauge_value = 0.0;
+ 
 	debug_out(F("output values to display..."), DEBUG_MIN_INFO, 1);
 	if (cfg::ppd_read) {
 		pm10_value = last_value_PPD_P1;
@@ -3325,6 +3669,30 @@ void display_values() {
 		p_value = last_value_BME280_P;
 		p_sensor = FPSTR(SENSORS_BME280);
 	}
+  if (cfg::ads_ws1_wspeed_read) {
+    ads_ws1_wspeed_value = last_value_ADS_WS1_windSpeed; 
+    ads_ws1_wspeed_sensor = FPSTR(SENSORS_ADS_WS1_WS);
+  }
+  if (cfg::ads_ws1_wdir_read) {
+    ads_ws1_wdir_value = last_value_ADS_WS1_windDir; 
+    ads_ws1_wdir_sensor = FPSTR(SENSORS_ADS_WS1_WD);
+  }
+  if (cfg::ads_ws1_raingauge_read) {
+    ads_ws1_raingauge_value = last_value_ADS_WS1_rain; 
+    ads_ws1_raingauge_sensor = FPSTR(SENSORS_ADS_WS1_RG);
+  }
+  if (cfg::davis_wspeed_read) {
+    davis_wspeed_value = last_value_Davis_windSpeed; 
+    davis_wspeed_sensor = FPSTR(SENSORS_DAVIS_WS);
+  }
+  if (cfg::davis_wdir_read) {
+    davis_wdir_value = last_value_Davis_windDir; 
+    davis_wdir_sensor = FPSTR(SENSORS_DAVIS_WD);
+  }
+  if (cfg::rg_11_raingauge_read) {
+    rg_11_raingauge_value = last_value_RG_11_rain; 
+    rg_11_raingauge_sensor = FPSTR(SENSORS_RG_11);
+  }
 	if (cfg::gps_read) {
 		lat_value = last_value_GPS_lat;
 		lon_value = last_value_GPS_lon;
@@ -3540,163 +3908,608 @@ bool initBME280(char addr) {
 	}
 }
 
+/*****************************************************************
+/* Init Generic Wind speed                                       *
+/*****************************************************************/
+void initWindSpeed() {
+  pinMode(windspeed_pin, INPUT_PULLUP);
+   
+  // init interrupt handled switch data
+  windspeed_first_flag = true;
+  windspeed_min_period = windspeed_max_period; 
+  windspeed_avg_period = 0;
+  windspeed_count = 0;
+  windspeed_start = micros();
+  
+  debug_out("INIT wind speed.", DEBUG_MIN_INFO, 1);
+   
+  // Setting interrupts
+  attachInterrupt(digitalPinToInterrupt(windspeed_pin), windspeed_tick, FALLING);
+  return;
+}
+
+/*****************************************************************
+/* Init Generic rain gauge                                       *
+/*****************************************************************/
+void initRainGauge() {
+  pinMode(rain_pin, INPUT_PULLUP);
+
+  // init interrupt handled switch data
+  rain_first_flag = true;
+  rain_count = 0;  
+  rain_prev_count = rain_count;
+
+  debug_out("INIT rain gauge... Attaching interrupt to pin " + Float2String(rain_pin), DEBUG_MIN_INFO, 1);
+  
+  // Setting interrupts
+  attachInterrupt(digitalPinToInterrupt(rain_pin), rain_tick, FALLING);
+  return;
+}
+
+/*****************************************************************
+/* Init Generic Wind Direction                                   *
+/*****************************************************************/
+void initWindDir() {
+  // Init ADC 1115 if used
+  if (ADS1115) { 
+    ads1115.setGain(GAIN_ONE);
+    //ads1115.setGain(GAIN_TWOTHIRDS);
+    ads1115.begin();
+  }
+  
+  // Specific initialization only for the ADS_WS1
+  if (cfg::ads_ws1_wdir_read) 
+    initADS_WS1_WindDir();
+
+  debug_out("ADC offset:" + Float2String(adc_offset), DEBUG_MIN_INFO, 1); 
+  debug_out("ADC gain:" + Float2String(adc_gain), DEBUG_MIN_INFO, 1); 
+
+  return;
+}
+
+/*****************************************************************
+/* Init ADS-WS1 Wind speed                                       *
+/*****************************************************************/
+bool initADS_WS1_WindSpeed() {
+
+  // No specific initialization needed
+  
+  return true;
+}
+
+/*****************************************************************
+/* Init ADS-WS1 Wind Direction                                   *
+/*****************************************************************/
+bool initADS_WS1_WindDir() {
+  // Init wind direction voltage values. 0 and v_ref are added as the first and last value 
+
+  v_out[0] = 0.0;
+  v_out[DIR_N_VAL + 1] = v_ref;
+  
+  for (int i=0; i<DIR_N_VAL; i++){
+    v_out[i+1] = (resistances_aws[i] / (resistances_aws[i] + r_part_aws)) * v_ref; 
+  }
+
+  for (int i=0; i<DIR_N_VAL+2; i++){
+    debug_out("Angle:" + Float2String(float(dir_val[i])) + ", vout =" + Float2String(float(v_out[i])), DEBUG_MAX_INFO, 1);
+  }
+  return true;
+}
+
+/*****************************************************************
+/* Init ADS-WS1 Rain Gauge                                       *
+/*****************************************************************/
+bool initADS_WS1_RainGauge() {
+
+  // No specific initialization needed
+  
+  return true;
+}
+
+/*****************************************************************
+/* Init Davis Wind speed                                         *
+/*****************************************************************/
+bool initDavis_WindSpeed() {
+
+  // No specific initialization needed
+  
+  return true;
+}
+
+/*****************************************************************
+/* Init Davis Wind Direction                                     *
+/*****************************************************************/
+bool initDavis_WindDir() {
+  
+  // No specific initialization needed
+   
+  return true;
+}
+
+/*****************************************************************
+/* Init RG-11 Rain Gauge                                         *
+/*****************************************************************/
+bool initRG_11_RainGauge() {
+
+  // No specific initialization needed
+  
+  return true;
+}
+
+/*****************************************************************
+/* Init GPS                                                      *
+/*****************************************************************/
+bool initGPS() {
+  // Instantiate the serial port for GPS. It set pin direction too.
+  
+   // Reinit the software serial to set pins for GPS 
+  serialGPS = SoftwareSerial(GPS_SERIAL_RX, GPS_SERIAL_TX, false, 128);
+  serialGPS.begin(9600);
+  
+  return true;
+}
+
+/*****************************************************************
+/* Deactivate Generic Wind speed                                 *
+/*****************************************************************/
+void DeactivateWindSpeed() {
+  
+  // Detaching interrupts
+  detachInterrupt(digitalPinToInterrupt(windspeed_pin));
+  return;
+}
+
+/*****************************************************************
+/* Deactivate Generic rain gauge                                 *
+/*****************************************************************/
+void DeactivateRainGauge() {
+ 
+  // Detaching interrupts
+  detachInterrupt(digitalPinToInterrupt(rain_pin));
+  return;
+}
+
+/*****************************************************************
+/* Deactivate Generic Wind Dir                                   *
+/*****************************************************************/
+void DeactivateWindDir() {
+  // Do nothing. This function exists only for consistency with the other functions
+  return;
+}
+
+/*****************************************************************
+/* Deactivate GPS                                                *
+/*****************************************************************/
+void DeactivateGPS() {
+  // Remove Software serial object used by GPS. Now pins can be safely reused
+
+  return;
+}
+
+/*****************************************************************
+/* Sensors Status Checking function                              *
+/*****************************************************************/
+
+
+void check_sensors_status(){
+
+  enum state{NotActive=0, Active=1};
+  
+  static enum state wspeed_status = NotActive;
+  static enum state raingauge_status = NotActive;
+  static enum state wdir_status = NotActive;
+  static enum state GPS_status = NotActive;
+
+  debug_out("CHECK STATUS SENSORS. wspeed_status: " + Float2String(wspeed_status) + ", read: " + Float2String(cfg::ads_ws1_wspeed_read || cfg::davis_wspeed_read), DEBUG_MIN_INFO, 1);
+  debug_out("CHECK STATUS SENSORS. raingauge_status: " + Float2String(raingauge_status) + ", read: " + Float2String(cfg::ads_ws1_raingauge_read || cfg::rg_11_raingauge_read), DEBUG_MIN_INFO, 1);
+  debug_out("CHECK STATUS SENSORS. wdir_status: " + Float2String(wdir_status) + ", read: " + Float2String(cfg::ads_ws1_wdir_read || cfg::davis_wdir_read), DEBUG_MIN_INFO, 1);
+  debug_out("CHECK STATUS SENSORS. GPS_status: " + Float2String(GPS_status) + ", read: " + Float2String(cfg::gps_read), DEBUG_MIN_INFO, 1);
+  
+  
+  // Wind speed sensor
+  switch(wspeed_status) {
+    case Active :
+            if (!cfg::ads_ws1_wspeed_read && !cfg::davis_wspeed_read) {
+              DeactivateWindSpeed();
+              wspeed_status = NotActive;
+            }
+            break;
+            
+    case NotActive :
+            if (cfg::ads_ws1_wspeed_read || cfg::davis_wspeed_read){
+              initWindSpeed();
+              wspeed_status = Active;                
+            }
+            break;
+            
+    default : {wspeed_status = NotActive;}
+              
+   }
+ 
+  // Rain gauge sensor
+  switch(raingauge_status) {
+    case Active:
+            if (!cfg::ads_ws1_raingauge_read && !cfg::rg_11_raingauge_read) {
+              DeactivateRainGauge();
+              raingauge_status = NotActive;
+            }
+            break;
+            
+    case NotActive:
+            if (cfg::ads_ws1_raingauge_read || cfg::rg_11_raingauge_read) {
+              initRainGauge();
+              raingauge_status = Active;
+            }
+            break;
+            
+    default: {raingauge_status = NotActive;}
+  }
+  
+  // ADS_WS1 Wind dir sensor
+  switch (wdir_status) {
+    case Active:
+            if (!cfg::ads_ws1_wdir_read && !cfg::davis_wdir_read){
+              DeactivateWindDir();
+              wdir_status = NotActive;  
+            }
+            break;
+
+    case NotActive:
+            if (cfg::ads_ws1_wdir_read || cfg::davis_wdir_read) {
+              initWindDir();
+              wdir_status = Active;
+            } 
+            break;
+
+    default: {wdir_status = NotActive;}
+  }
+
+  // GPS sensor
+  switch (GPS_status) {
+    case Active:
+            if (!cfg::gps_read){
+              DeactivateGPS();
+              GPS_status = NotActive;  
+            }
+
+            // Force deactivate GPS if wind speed or rain gauge active
+            if (raingauge_status || wspeed_status){ 
+              DeactivateGPS();
+              GPS_status = NotActive;
+              cfg::gps_read = 0;  
+            }
+            break;
+
+    case NotActive:
+            if (cfg::gps_read && !raingauge_status && !wspeed_status) {
+              initGPS();
+              GPS_status = Active;
+            }
+            else{
+              cfg::gps_read = 0; 
+            }
+            break;
+
+    default: {GPS_status = NotActive;}
+  }
+ 
+}
+
+/*****************************************************************
+/* Interrupt handler for wind speed and rain sensors             *
+/*****************************************************************/
+
+void windspeed_tick(){
+  
+  long time_elapsed = micros() - windspeed_start;
+  // check if the first tick occurs
+  if (windspeed_first_flag) {
+    if (time_elapsed > debounce_time) {
+      windspeed_first_flag = false;
+      windspeed_count++;
+      windspeed_start = micros();
+      debug_out("WINDSPEED INTERRUPT -- first", DEBUG_MAX_INFO, 1);
+      return;
+    }
+  }
+  else{
+    if (time_elapsed > debounce_time) {
+      windspeed_period = time_elapsed;
+      windspeed_count++;
+      windspeed_first_flag = true;
+      windspeed_start = micros();
+      debug_out("WINDSPEED INTERRUPT -- not first", DEBUG_MAX_INFO, 1);
+      return;
+    }
+  }
+  debug_out("WINDSPEED INTERRUPT -- bounce ", DEBUG_MAX_INFO, 1);
+}
+
+void rain_tick(){
+  debug_out("RAIN INTERRUPT, count:" + Float2String(float(rain_count)), DEBUG_MAX_INFO, 1);
+
+  // check if the first tick occurs
+  long time_elapsed = micros() - rain_start;
+  if (rain_first_flag) {
+    if (time_elapsed > debounce_time) { 
+      rain_first_flag = false;
+      rain_count++;
+      rain_start = micros();
+    }
+  }
+  else{
+    if (time_elapsed > debounce_time) { 
+      rain_period = time_elapsed;
+      rain_count++;
+      rain_first_flag = true;
+      rain_start = micros();
+    }
+  }
+}
+
+/*****************************************************************
+/* ADC Calibration                                               *
+/*****************************************************************/
+bool wind_dir_calibration(int calibration_step){
+  int n_samples = 10;
+  static float v90 = 0.0;
+  static float v270 = 0.0;
+  float v90_ref;
+  float v270_ref;
+  
+  switch (calibration_step){
+    case 1: // Take the mean value of some adc readings at 90 degrees
+            v90 = get_adc_voltage_mean(n_samples); 
+            break;
+            
+    case 2: // Take the mean value of some adc readings at 90 degrees
+            v270 = get_adc_voltage_mean(n_samples); 
+            
+            // Compute offset and gain and store them to flash
+            if (cfg::ads_ws1_wdir_read) {
+              // Code for the adc calibration of ADS-WS1 wind direction sensor 
+              v90_ref = v_out[3];
+              v270_ref = v_out[16];
+            }
+            else {
+              // Put here the specific code for the calibration of other wind direction sensor (i.e., Davis)
+              //float min_v_ref = v_out[3];
+              //float max_v_ref = v_out[16];
+            }
+
+            float min_v = min(v90, v270);
+            float max_v = max(v90, v270);
+            float min_v_ref = min(v90_ref, v270_ref);
+            float max_v_ref = max(v90_ref, v270_ref);
+            
+            adc_offset = min_v - min_v_ref;
+            adc_gain = (max_v - adc_offset) / max_v_ref;
+            
+            debug_out("v90:", DEBUG_MIN_INFO, 1); debug_out(Float2String(v90), DEBUG_MAX_INFO, 1);
+            debug_out("v270:", DEBUG_MIN_INFO, 1); debug_out(Float2String(v270), DEBUG_MAX_INFO, 1);
+            debug_out("v90_ref:", DEBUG_MIN_INFO, 1); debug_out(Float2String(v90_ref), DEBUG_MAX_INFO, 1);
+            debug_out("v270_ref:", DEBUG_MIN_INFO, 1); debug_out(Float2String(v270_ref), DEBUG_MAX_INFO, 1);
+            debug_out("ADC OFFSET:", DEBUG_MIN_INFO, 1); debug_out(Float2String(adc_offset), DEBUG_MAX_INFO, 1);
+            debug_out("ADC GAIN:", DEBUG_MIN_INFO, 1); debug_out(Float2String(adc_gain), DEBUG_MAX_INFO, 1);
+            break;
+  }
+  
+}
+
+float get_adc_voltage_mean(int n_samples){
+  float v_sum = 0.0;
+  for (int i=0; i< n_samples; i++){
+    int adc0 = analogRead(wind_direction_pin);
+    delay(100); // add some delay    
+    float v = (adc0 * v_LSB) / voltage_divider_factor; // Volts
+    debug_out("ADC READ: " + Float2String(adc0) + ", Voltage: " + Float2String(v), DEBUG_MIN_INFO, 1);
+    v_sum += v;
+    yield; 
+  }
+  return v_sum / n_samples;
+}
+
+float adc_voltage(){
+  // ch is used only for ADS1115
+  float v = -1.0;
+  int adc0;
+  
+  if (ADS1115){
+    adc0 = ads1115.readADC_SingleEnded(0);
+    v = (adc0 * ads1115_LSB) / 1000; // voltage in the range 0-3.3V
+  }
+  else { // using the nodemcu builtin ADC
+    adc0 = analogRead(wind_direction_pin);
+    v = (((adc0 * v_LSB) / voltage_divider_factor) - adc_offset) / adc_gain; // voltage in the range 0-3.3V
+  }
+
+  debug_out("ADC READ: " + Float2String(adc0) + ", Voltage: " + Float2String(v), DEBUG_MED_INFO, 1);
+  return v;
+}
+
 static void powerOnTestSensors() {
-	if (cfg::ppd_read) {
-		pinMode(PPD_PIN_PM1, INPUT_PULLUP);                 // Listen at the designated PIN
-		pinMode(PPD_PIN_PM2, INPUT_PULLUP);                 // Listen at the designated PIN
-		debug_out(F("Read PPD..."), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::ppd_read) {
+    pinMode(PPD_PIN_PM1, INPUT_PULLUP);                 // Listen at the designated PIN
+    pinMode(PPD_PIN_PM2, INPUT_PULLUP);                 // Listen at the designated PIN
+    debug_out(F("Read PPD..."), DEBUG_MIN_INFO, 1);
+  }
 
-	if (cfg::sds_read) {
-		debug_out(F("Read SDS..."), DEBUG_MIN_INFO, 1);
-		SDS_cmd(PmSensorCmd::Start);
-		delay(100);
-		SDS_cmd(PmSensorCmd::ContinuousMode);
-		delay(100);
-		debug_out(F("Stopping SDS011..."), DEBUG_MIN_INFO, 1);
-		is_SDS_running = SDS_cmd(PmSensorCmd::Stop);
-	}
+  if (cfg::sds_read) {
+    debug_out(F("Read SDS..."), DEBUG_MIN_INFO, 1);
+    SDS_cmd(PmSensorCmd::Start);
+    delay(100);
+    SDS_cmd(PmSensorCmd::ContinuousMode);
+    delay(100);
+    debug_out(F("Stopping SDS011..."), DEBUG_MIN_INFO, 1);
+    is_SDS_running = SDS_cmd(PmSensorCmd::Stop);
+  }
 
-	if (cfg::pms_read) {
-		debug_out(F("Read PMS(1,3,5,6,7)003..."), DEBUG_MIN_INFO, 1);
-		PMS_cmd(PmSensorCmd::Start);
-		delay(100);
-		PMS_cmd(PmSensorCmd::ContinuousMode);
-		delay(100);
-		debug_out(F("Stopping PMS..."), DEBUG_MIN_INFO, 1);
-		is_PMS_running = PMS_cmd(PmSensorCmd::Stop);
-	}
+  if (cfg::pms_read) {
+    debug_out(F("Read PMS(1,3,5,6,7)003..."), DEBUG_MIN_INFO, 1);
+    PMS_cmd(PmSensorCmd::Start);
+    delay(100);
+    PMS_cmd(PmSensorCmd::ContinuousMode);
+    delay(100);
+    debug_out(F("Stopping PMS..."), DEBUG_MIN_INFO, 1);
+    is_PMS_running = PMS_cmd(PmSensorCmd::Stop);
+  }
 
-	if (cfg::hpm_read) {
-		debug_out(F("Read HPM..."), DEBUG_MIN_INFO, 1);
-		HPM_cmd(PmSensorCmd::Start);
-		delay(100);
-		HPM_cmd(PmSensorCmd::ContinuousMode);
-		delay(100);
-		debug_out(F("Stopping HPM..."), DEBUG_MIN_INFO, 1);
-		is_HPM_running = HPM_cmd(PmSensorCmd::Stop);
-	}
+  if (cfg::hpm_read) {
+    debug_out(F("Read HPM..."), DEBUG_MIN_INFO, 1);
+    HPM_cmd(PmSensorCmd::Start);
+    delay(100);
+    HPM_cmd(PmSensorCmd::ContinuousMode);
+    delay(100);
+    debug_out(F("Stopping HPM..."), DEBUG_MIN_INFO, 1);
+    is_HPM_running = HPM_cmd(PmSensorCmd::Stop);
+  }
 
-	if (cfg::dht_read) {
-		dht.begin();                                        // Start DHT
-		debug_out(F("Read DHT..."), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::dht_read) {
+    dht.begin();                                        // Start DHT
+    debug_out(F("Read DHT..."), DEBUG_MIN_INFO, 1);
+  }
 
-	if (cfg::htu21d_read) {
-		htu21d.begin();                                     // Start HTU21D
-		debug_out(F("Read HTU21D..."), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::htu21d_read) {
+    htu21d.begin();                                     // Start HTU21D
+    debug_out(F("Read HTU21D..."), DEBUG_MIN_INFO, 1);
+  }
 
-	if (cfg::bmp_read) {
-		debug_out(F("Read BMP..."), DEBUG_MIN_INFO, 1);
-		if (!bmp.begin()) {
-			debug_out(F("No valid BMP085 sensor, check wiring!"), DEBUG_MIN_INFO, 1);
-			bmp_init_failed = 1;
-		}
-	}
+  if (cfg::bmp_read) {
+    debug_out(F("Read BMP..."), DEBUG_MIN_INFO, 1);
+    if (!bmp.begin()) {
+      debug_out(F("No valid BMP085 sensor, check wiring!"), DEBUG_MIN_INFO, 1);
+      bmp_init_failed = 1;
+    }
+  }
 
-	if (cfg::bmp280_read) {
-		debug_out(F("Read BMP280..."), DEBUG_MIN_INFO, 1);
-		if (!initBMP280(0x76) && !initBMP280(0x77)) {
-			debug_out(F("Check BMP280 wiring"), DEBUG_MIN_INFO, 1);
-			bmp280_init_failed = 1;
-		}
-	}
+  if (cfg::bmp280_read) {
+    debug_out(F("Read BMP280..."), DEBUG_MIN_INFO, 1);
+    if (!initBMP280(0x76) && !initBMP280(0x77)) {
+      debug_out(F("Check BMP280 wiring"), DEBUG_MIN_INFO, 1);
+      bmp280_init_failed = 1;
+    }
+  }
 
-	if (cfg::bme280_read) {
-		debug_out(F("Read BME280..."), DEBUG_MIN_INFO, 1);
-		if (!initBME280(0x76) && !initBME280(0x77)) {
-			debug_out(F("Check BME280 wiring"), DEBUG_MIN_INFO, 1);
-			bme280_init_failed = 1;
-		}
-	}
+  if (cfg::bme280_read) {
+    debug_out(F("Read BME280..."), DEBUG_MIN_INFO, 1);
+    if (!initBME280(0x76) && !initBME280(0x77)) {
+      debug_out(F("Check BME280 wiring"), DEBUG_MIN_INFO, 1);
+      bme280_init_failed = 1;
+    }
+  }
 
-	if (cfg::ds18b20_read) {
-		ds18b20.begin();                                    // Start DS18B20
-		debug_out(F("Read DS18B20..."), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::ds18b20_read) {
+    ds18b20.begin();                                    // Start DS18B20
+    debug_out(F("Read DS18B20..."), DEBUG_MIN_INFO, 1);
+  }
+
+  if (cfg::ads_ws1_wspeed_read) { 
+    debug_out(F("Lese ADS-WS1 Weather Station wind speed sensor..."), DEBUG_MIN_INFO, 1); 
+  }
+  
+  if (cfg::ads_ws1_wdir_read) { 
+    debug_out(F("Lese ADS-WS1 Weather Station wind direction sensor..."), DEBUG_MIN_INFO, 1); 
+  }
+  
+  if (cfg::ads_ws1_raingauge_read) {
+    debug_out(F("Lese ADS-WS1 Weather Station rain gauge..."), DEBUG_MIN_INFO, 1); 
+  }
+  
+  if (cfg::davis_wspeed_read) { 
+    debug_out(F("Lese Davis Weather Station wind speed sensor..."), DEBUG_MIN_INFO, 1); 
+  }
+  
+  if (cfg::davis_wdir_read) { 
+    debug_out(F("Lese Davis Weather Station wind direction sensor..."), DEBUG_MIN_INFO, 1); 
+  }
+  
+  if (cfg::rg_11_raingauge_read) { 
+    debug_out(F("Lese RG-11 Weather Station rain gauge..."), DEBUG_MIN_INFO, 1); 
+  }
+
+  check_sensors_status();
 }
 
 static void logEnabledAPIs() {
-	debug_out(F("Send to :"), DEBUG_MIN_INFO, 1);
-	if (cfg::send2dusti) {
-		debug_out(F("luftdaten.info"), DEBUG_MIN_INFO, 1);
-	}
+  debug_out(F("Send to :"), DEBUG_MIN_INFO, 1);
+  if (cfg::send2dusti) {
+    debug_out(F("luftdaten.info"), DEBUG_MIN_INFO, 1);
+  }
 
-	if (cfg::send2madavi) {
-		debug_out(F("Madavi.de"), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::send2madavi) {
+    debug_out(F("Madavi.de"), DEBUG_MIN_INFO, 1);
+  }
 
-	if (cfg::send2lora) {
-		debug_out(F("LoRa gateway"), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::send2lora) {
+    debug_out(F("LoRa gateway"), DEBUG_MIN_INFO, 1);
+  }
 
-	if (cfg::send2csv) {
-		debug_out(F("Serial as CSV"), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::send2csv) {
+    debug_out(F("Serial as CSV"), DEBUG_MIN_INFO, 1);
+  }
 
-	if (cfg::send2custom) {
-		debug_out(F("custom API"), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::send2custom) {
+    debug_out(F("custom API"), DEBUG_MIN_INFO, 1);
+  }
 
-	if (cfg::send2influx) {
-		debug_out(F("custom influx DB"), DEBUG_MIN_INFO, 1);
-	}
-	debug_out("", DEBUG_MIN_INFO, 1);
-	if (cfg::auto_update) {
-		debug_out(F("Auto-Update active..."), DEBUG_MIN_INFO, 1);
-		debug_out("", DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::send2influx) {
+    debug_out(F("custom influx DB"), DEBUG_MIN_INFO, 1);
+  }
+  debug_out("", DEBUG_MIN_INFO, 1);
+  if (cfg::auto_update) {
+    debug_out(F("Auto-Update active..."), DEBUG_MIN_INFO, 1);
+    debug_out("", DEBUG_MIN_INFO, 1);
+  }
 }
 
 static void logEnabledDisplays() {
-	if (cfg::has_display || cfg::has_sh1106) {
-		debug_out(F("Show on OLED..."), DEBUG_MIN_INFO, 1);
-	}
-	if (cfg::has_lcd1602 || cfg::has_lcd1602_27) {
-		debug_out(F("Show on LCD 1602 ..."), DEBUG_MIN_INFO, 1);
-	}
-	if (cfg::has_lcd2004_27) {
-		debug_out(F("Show on LCD 2004 ..."), DEBUG_MIN_INFO, 1);
-	}
+  if (cfg::has_display || cfg::has_sh1106) {
+    debug_out(F("Show on OLED..."), DEBUG_MIN_INFO, 1);
+  }
+  if (cfg::has_lcd1602 || cfg::has_lcd1602_27) {
+    debug_out(F("Show on LCD 1602 ..."), DEBUG_MIN_INFO, 1);
+  }
+  if (cfg::has_lcd2004_27) {
+    debug_out(F("Show on LCD 2004 ..."), DEBUG_MIN_INFO, 1);
+  }
 }
 
 void time_is_set (void) {
-	sntp_time_is_set = true;
+  sntp_time_is_set = true;
 }
 
 static bool acquireNetworkTime() {
-	int retryCount = 0;
-	debug_out(F("Setting time using SNTP"), DEBUG_MIN_INFO, 1);
-	time_t now = time(nullptr);
-	debug_out(ctime(&now), DEBUG_MIN_INFO, 1);
-	debug_out(F("NTP.org:"),DEBUG_MIN_INFO,1);
-	settimeofday_cb(time_is_set);
-	configTime(8 * 3600, 0, "pool.ntp.org");
-	while (retryCount++ < 20) {
-		// later than 2000/01/01:00:00:00
-		if (sntp_time_is_set) {
-			now = time(nullptr);
-			debug_out(ctime(&now), DEBUG_MIN_INFO, 1);
-			return true;
-		}
-		delay(500);
-		debug_out(".",DEBUG_MIN_INFO,0);
-	}
-	debug_out(F("\nrouter/gateway:"),DEBUG_MIN_INFO,1);
-	retryCount = 0;
-	configTime(0, 0, WiFi.gatewayIP().toString().c_str());
-	while (retryCount++ < 20) {
-		// later than 2000/01/01:00:00:00
-		if (sntp_time_is_set) {
-			now = time(nullptr);
-			debug_out(ctime(&now), DEBUG_MIN_INFO, 1);
-			return true;
-		}
-		delay(500);
-		debug_out(".",DEBUG_MIN_INFO,0);
-	}
-	return false;
+  int retryCount = 0;
+  debug_out(F("Setting time using SNTP"), DEBUG_MIN_INFO, 1);
+  time_t now = time(nullptr);
+  debug_out(ctime(&now), DEBUG_MIN_INFO, 1);
+  debug_out(F("NTP.org:"),DEBUG_MIN_INFO,1);
+  settimeofday_cb(time_is_set);
+  configTime(8 * 3600, 0, "pool.ntp.org");
+  while (retryCount++ < 20) {
+    // later than 2000/01/01:00:00:00
+    if (sntp_time_is_set) {
+      now = time(nullptr);
+      debug_out(ctime(&now), DEBUG_MIN_INFO, 1);
+      return true;
+    }
+    delay(500);
+    debug_out(".",DEBUG_MIN_INFO,0);
+  }
+  debug_out(F("\nrouter/gateway:"),DEBUG_MIN_INFO,1);
+  retryCount = 0;
+  configTime(0, 0, WiFi.gatewayIP().toString().c_str());
+  while (retryCount++ < 20) {
+    // later than 2000/01/01:00:00:00
+    if (sntp_time_is_set) {
+      now = time(nullptr);
+      debug_out(ctime(&now), DEBUG_MIN_INFO, 1);
+      return true;
+    }
+    delay(500);
+    debug_out(".",DEBUG_MIN_INFO,0);
+  }
+  return false;
 }
 
 /*****************************************************************
@@ -3831,7 +4644,13 @@ void loop() {
 	String result_BME280 = "";
 	String result_DS18B20 = "";
 	String result_GPS = "";
-
+  String result_ADS_WS1_windSpeed = "";
+  String result_ADS_WS1_windDir = "";
+  String result_ADS_WS1_rain = "";
+  String result_Davis_windSpeed = "";
+  String result_Davis_windDir = "";
+  String result_RG_11_rain = "";
+  
 	unsigned long sum_send_time = 0;
 	unsigned long start_send;
 
@@ -3880,6 +4699,11 @@ void loop() {
 	}
 
 	server.handleClient();
+  
+  // Check sensor that use interrupts or share PINs
+  if (send_now) {
+    check_sensors_status();
+  }
 
 	if (send_now) {
 		if (cfg::dht_read) {
@@ -3911,6 +4735,36 @@ void loop() {
 			debug_out(String(FPSTR(DBG_TXT_CALL_SENSOR)) + FPSTR(SENSORS_DS18B20), DEBUG_MAX_INFO, 1);
 			result_DS18B20 = sensorDS18B20();               // getting temperature (optional)
 		}
+    
+    if (cfg::ads_ws1_wspeed_read) {
+      debug_out(F("ADS_WS1, call wind speed sensor"), DEBUG_MAX_INFO, 1);
+      result_ADS_WS1_windSpeed = sensorADS_WS1_WindSpeed();
+    }
+    
+    if (cfg::ads_ws1_wdir_read) {
+      debug_out(F("ADS_WS1, call wind direction sensor"), DEBUG_MAX_INFO, 1);
+      result_ADS_WS1_windDir = sensorADS_WS1_WindDir();
+    }
+    
+    if (cfg::ads_ws1_raingauge_read) {
+      debug_out(F("ADS_WS1, call rain gauge sensor"), DEBUG_MAX_INFO, 1);
+      result_ADS_WS1_rain = sensorADS_WS1_Rain();
+    }
+
+    if (cfg::davis_wspeed_read) {
+      debug_out(F("Davis, call wind speed sensor"), DEBUG_MAX_INFO, 1);
+      result_Davis_windSpeed = sensorDavis_WindSpeed();
+    }
+    
+    if (cfg::davis_wdir_read) {
+      debug_out(F("Davis, call wind direction sensor"), DEBUG_MAX_INFO, 1);
+      result_Davis_windDir = sensorDavis_WindDir();
+    }
+    
+    if (cfg::rg_11_raingauge_read) {
+      debug_out(F("RG-11, call rain gauge sensor"), DEBUG_MAX_INFO, 1);
+      result_RG_11_rain = sensorRG_11_Rain();
+    }
 	}
 
 	if (cfg::gps_read && ((msSince(starttime_GPS) > SAMPLETIME_GPS_MS) || send_now)) {
@@ -4044,6 +4898,84 @@ void loop() {
 			}
 		}
 
+    if (cfg::ads_ws1_wspeed_read) {
+      data += result_ADS_WS1_windSpeed;
+      
+      if (cfg::send2dusti) {
+        debug_out(F("## Fake Sending to luftdaten.info (Weather Station): "), DEBUG_MIN_INFO, 1);
+        start_send = micros();
+        
+        // FIXME Set parameters to send data to luftdaten
+        //sendLuftdaten(result_SDS, SDS_API_PIN, host_dusti, httpPort_dusti, url_dusti, "SDS_");        
+        sum_send_time += micros() - start_send;
+      }
+    }
+
+    if (cfg::ads_ws1_wdir_read) {
+      data += result_ADS_WS1_windDir;
+      
+      if (cfg::send2dusti) {
+        debug_out(F("## Fake Sending to luftdaten.info (Weather Station): "), DEBUG_MIN_INFO, 1);
+        start_send = micros();
+        
+        // FIXME Set parameters to send data to luftdaten
+        //sendLuftdaten(result_SDS, SDS_API_PIN, host_dusti, httpPort_dusti, url_dusti, "SDS_");        
+        sum_send_time += micros() - start_send;
+      }
+    }
+
+    if (cfg::ads_ws1_raingauge_read) {
+      data += result_ADS_WS1_rain;
+      
+      if (cfg::send2dusti) {
+        debug_out(F("## Fake Sending to luftdaten.info (Weather Station): "), DEBUG_MIN_INFO, 1);
+        start_send = micros();
+        
+        // FIXME Set parameters to send data to luftdaten
+        //sendLuftdaten(result_SDS, SDS_API_PIN, host_dusti, httpPort_dusti, url_dusti, "SDS_");        
+        sum_send_time += micros() - start_send;
+      }
+    }
+
+    if (cfg::davis_wspeed_read) {
+      data += result_Davis_windSpeed;
+      
+      if (cfg::send2dusti) {
+        debug_out(F("## Fake Sending to luftdaten.info (Weather Station): "), DEBUG_MIN_INFO, 1);
+        start_send = micros();
+        
+        // FIXME Set parameters to send data to luftdaten
+        //sendLuftdaten(result_SDS, SDS_API_PIN, host_dusti, httpPort_dusti, url_dusti, "SDS_");        
+        sum_send_time += micros() - start_send;
+      }
+    }
+
+    if (cfg::davis_wdir_read) {
+      data += result_Davis_windDir;
+      
+      if (cfg::send2dusti) {
+        debug_out(F("## Fake Sending to luftdaten.info (Weather Station): "), DEBUG_MIN_INFO, 1);
+        start_send = micros();
+        
+        // FIXME Set parameters to send data to luftdaten
+        //sendLuftdaten(result_SDS, SDS_API_PIN, host_dusti, httpPort_dusti, url_dusti, "SDS_");        
+        sum_send_time += micros() - start_send;
+      }
+    }
+
+    if (cfg::rg_11_raingauge_read) {
+      data += result_RG_11_rain;
+      
+      if (cfg::send2dusti) {
+        debug_out(F("## Fake Sending to luftdaten.info (Weather Station): "), DEBUG_MIN_INFO, 1);
+        start_send = micros();
+        
+        // FIXME Set parameters to send data to luftdaten
+        //sendLuftdaten(result_SDS, SDS_API_PIN, host_dusti, httpPort_dusti, url_dusti, "SDS_");        
+        sum_send_time += micros() - start_send;
+      }
+    }
+    
 		data_sample_times += Value2Json("signal", signal_strength);
 		data += data_sample_times;
 
